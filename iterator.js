@@ -1,72 +1,82 @@
-var util = require('util')
-var AbstractIterator  = require('abstract-leveldown').AbstractIterator
-var ltgt = require('ltgt')
+var AbstractIterator = require('abstract-leveldown').AbstractIterator
+var inherits = require('inherits')
+var EventEmitter = require('events').EventEmitter
 
 module.exports = Iterator
+inherits(Iterator, AbstractIterator)
 
-function Iterator (db, options) {
-  if (!options) options = {}
-  this.options = options
-  AbstractIterator.call(this, db)
-  this._order = options.reverse ? 'DESC': 'ASC'
-  this._limit = options.limit
-  this._count = 0
-  this._done  = false
-  var lower = ltgt.lowerBound(options)
-  var upper = ltgt.upperBound(options)
-  try {
-    this._keyRange = lower || upper ? this.db.makeKeyRange({
-      lower: lower,
-      upper: upper,
-      excludeLower: ltgt.lowerBoundExclusive(options),
-      excludeUpper: ltgt.upperBoundExclusive(options)
-    }) : null
-  } catch (e) {
-    // The lower key is greater than the upper key.
-    // IndexedDB throws an error, but we'll just return 0 results.
-    this._keyRangeError = true
-  }
-  this.callback = null
-}
-
-util.inherits(Iterator, AbstractIterator)
-
-Iterator.prototype.createIterator = function() {
+function Iterator (idb, opts) {
+  if (!opts) opts = {}
   var self = this
+  AbstractIterator.call(this, idb)
+  self._idb = idb
+  self._queue = []
+  self._errors = []
+  self._ev = new EventEmitter
+  self._limit = opts.limit
 
-  self.iterator = self.db.iterate(function () {
-    self.onItem.apply(self, arguments)
-  }, {
-    keyRange: self._keyRange,
-    autoContinue: false,
-    order: self._order,
-    onError: function(err) { console.log('horrible error', err) },
+  var w = typeof global !== 'undefined' ? global : {}
+  var Range = opts.range || w.IDBKeyRange || w.mozIDBKeyRange
+    || w.webkitIDBKeyRange || w.msIDBKeyRange
+
+  var range = undefined
+  if (opts.lt !== undefined && opts.gt !== undefined) {
+    range = Range.bound(fix(opts.gt), fix(opts.lt), true, true)
+  } else if (opts.lt !== undefined && opts.gte !== undefined) {
+    range = Range.bound(fix(opts.gte), fix(opts.lt), false, true)
+  } else if (opts.lte !== undefined && opts.gt !== undefined) {
+    range = Range.bound(fix(opts.gt), fix(opts.lte), true, false)
+  } else if (opts.lte !== undefined && opts.gte !== undefined) {
+    range = Range.bound(fix(opts.lte), fix(opts.gte))
+  } else if (opts.lt !== undefined) {
+    range = Range.upperBound(fix(opts.lt), true)
+  } else if (opts.lte !== undefined) {
+    range = Range.upperBound(fix(opts.lte))
+  } else if (opts.gt !== undefined) {
+    range = Range.lowerBound(fix(opts.gt), true)
+  } else if (opts.gte !== undefined) {
+    range = Range.lowerBound(fix(opts.gte))
+  }
+  function fix (x) { return x.toString() }
+
+  var tx = idb.transaction(['data'], 'readonly')
+  var store = tx.objectStore('data')
+  var cur = store.openCursor(range)
+  cur.addEventListener('error', function (err) {
+    self._errors.push(err)
+    if (self._errors.length + self._queue.length === 1) {
+      self._ev.emit('_readable')
+    }
+  })
+  var n = 0
+  cur.addEventListener('success', function (ev) {
+    var cur = ev.target.result
+    self._queue.push(cur)
+    if (cur && self._limit && ++n >= self._limit) {
+      self._queue.push(undefined)
+    } else if (cur) cur['continue']()
+    if (self._errors.length + self._queue.length === 1) {
+      self._ev.emit('_readable')
+    }
   })
 }
 
-// TODO the limit implementation here just ignores all reads after limit has been reached
-// it should cancel the iterator instead but I don't know how
-Iterator.prototype.onItem = function (value, cursor, cursorTransaction) {
-  if (!cursor && this.callback) {
-    this.callback()
-    this.callback = false
-    return
+Iterator.prototype._next = function f (cb) {
+  var self = this
+  if (self._errors.length) ntick(cb, self, self._errors.shift())
+  else if (self._queue.length) {
+    var q = self._queue.shift()
+    if (!q) ntick(cb, self)
+    else ntick(cb, self, null, q.key, q.value)
   }
-  var shouldCall = true
-
-  if (!!this._limit && this._limit > 0 && this._count++ >= this._limit)
-    shouldCall = false
-
-  if (shouldCall) this.callback(false, cursor.key, cursor.value)
-  if (cursor) cursor['continue']()
+  else {
+    self._ev.once('_readable', function () { f.call(self, cb) })
+  }
 }
 
-Iterator.prototype._next = function (callback) {
-  if (!callback) return new Error('next() requires a callback argument')
-  if (this._keyRangeError) return callback()
-  if (!this._started) {
-    this.createIterator()
-    this._started = true
-  }
-  this.callback = callback
+Iterator.prototype._end = function (cb) { ntick(cb) }
+
+function ntick (cb, ctx) {
+  var args = [].slice.call(arguments, 2)
+  process.nextTick(function () { cb.apply(ctx, args) })
 }

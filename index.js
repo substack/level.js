@@ -1,8 +1,7 @@
 module.exports = Level
 
-var IDB = require('idb-wrapper')
 var AbstractLevelDOWN = require('abstract-leveldown').AbstractLevelDOWN
-var util = require('util')
+var inherits = require('inherits')
 var Iterator = require('./iterator')
 var isBuffer = require('isbuffer')
 var xtend = require('xtend')
@@ -15,7 +14,7 @@ function Level(location) {
   this.location = location
 }
 
-util.inherits(Level, AbstractLevelDOWN)
+inherits(Level, AbstractLevelDOWN)
 
 Level.prototype._open = function(options, callback) {
   var self = this
@@ -24,21 +23,31 @@ Level.prototype._open = function(options, callback) {
     storeName: this.location,
     autoIncrement: false,
     keyPath: null,
-    onStoreReady: function () {
-      callback && callback(null, self.idb)
-    }, 
-    onError: function(err) {
-      callback && callback(err)
-    }
   }
-  
   xtend(idbOpts, options)
   this.IDBOptions = idbOpts
-  this.idb = new IDB(idbOpts)
+
+  var IDB = options.idb || getIDB()
+  var r = IDB.open(idbOpts.storeName)
+  r.addEventListener('upgradeneeded', function () {
+    var db = r.result
+    db.createObjectStore('data')
+  })
+  r.addEventListener('error', callback)
+  r.addEventListener('success', function () {
+    self.idb = r.result
+    callback(null, self.idb)
+  })
 }
 
 Level.prototype._get = function (key, options, callback) {
-  this.idb.get(key, function (value) {
+  var tx = this.idb.transaction(['data'], 'readonly')
+  var store = tx.objectStore('data')
+  tx.addEventListener('error', callback)
+
+  var r = store.get(key)
+  r.addEventListener('success', function (ev) {
+    var value = ev.target.result
     if (value === undefined) {
       // 'NotFound' error, consistent with LevelDOWN API
       return callback(new Error('NotFound'))
@@ -52,11 +61,16 @@ Level.prototype._get = function (key, options, callback) {
       else value = new Buffer(String(value))
     }
     return callback(null, value, key)
-  }, callback)
+  })
+  r.addEventListener('error', callback)
 }
 
 Level.prototype._del = function(id, options, callback) {
-  this.idb.remove(id, callback, callback)
+  var tx = this.idb.transaction(['data'], 'readwrite')
+  var store = tx.objectStore('data')
+  var r = store.delete(id)
+  r.addEventListener('error', callback)
+  r.addEventListener('success', function () { callback(null) })
 }
 
 Level.prototype._put = function (key, value, options, callback) {
@@ -67,7 +81,11 @@ Level.prototype._put = function (key, value, options, callback) {
   if (Buffer.isBuffer(obj.value)) {
     obj.value = new Uint8Array(value.toArrayBuffer())
   }
-  this.idb.put(obj.key, obj.value, function() { callback() }, callback)
+  var tx = this.idb.transaction(['data'], 'readwrite')
+  var store = tx.objectStore('data')
+  var r = store.put(obj.value, obj.key)
+  r.addEventListener('success', function (ev) { callback(null, ev) })
+  r.addEventListener('error', callback)
 }
 
 Level.prototype.convertEncoding = function(key, value, options) {
@@ -119,11 +137,32 @@ Level.prototype._batch = function (array, options, callback) {
     }
   }
 
-  return this.idb.batch(modified, function(){ callback() }, callback)
+  // remove duplicate keys in the same batch:
+  var keys = {}
+  for (i = modified.length-1; i >= 0; i--) {
+    if (!modified[i]) continue
+    var key = modified[i].key
+    if (Object.hasOwnProperty.call(keys, key)) {
+      modified.splice(i, 1)
+    }
+    keys[key] = true
+  }
+
+  var tx = this.idb.transaction(['data'], 'readwrite')
+  tx.addEventListener('error', callback)
+  tx.addEventListener('complete', function () { callback(null) })
+  var store = tx.objectStore('data')
+  modified.forEach(function (op) {
+    if (op.type === 'put') {
+      store.put(op.value, op.key)
+    } else if (op.type === 'remove') {
+      store.delete(op.key)
+    }
+  })
 }
 
 Level.prototype._close = function (callback) {
-  this.idb.db.close()
+  this.idb.close()
   callback()
 }
 
@@ -147,7 +186,7 @@ Level.destroy = function (db, callback) {
     var prefix = 'IDBWrapper-'
     var dbname = db
   }
-  var request = indexedDB.deleteDatabase(prefix + dbname)
+  var request = getIDB().deleteDatabase(prefix + dbname)
   request.onsuccess = function() {
     callback()
   }
@@ -156,15 +195,8 @@ Level.destroy = function (db, callback) {
   }
 }
 
-var checkKeyValue = Level.prototype._checkKeyValue = function (obj, type) {
-  if (obj === null || obj === undefined)
-    return new Error(type + ' cannot be `null` or `undefined`')
-  if (obj === null || obj === undefined)
-    return new Error(type + ' cannot be `null` or `undefined`')
-  if (isBuffer(obj) && obj.byteLength === 0)
-    return new Error(type + ' cannot be an empty ArrayBuffer')
-  if (String(obj) === '')
-    return new Error(type + ' cannot be an empty String')
-  if (obj.length === 0)
-    return new Error(type + ' cannot be an empty Array')
+function getIDB () {
+  var w = typeof global !== 'undefined' ? global : {}
+  return w.indexedDB || w.mozIndexedDB
+    || w.webkitIndexedDB || w.msIndexedDB
 }
